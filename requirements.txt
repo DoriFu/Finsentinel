@@ -1,0 +1,9 @@
+streamlit
+openai
+rank-bm25
+scikit-learn
+feedparser
+datasets
+yfinance
+scipy
+plotly

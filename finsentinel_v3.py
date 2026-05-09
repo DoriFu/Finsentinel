@@ -805,6 +805,16 @@ def show_correlation_analysis(sentiment_scores_df, price_df):
     if len(analysis_df) < 3:
         st.warning("Not enough clean rows after dropping NaNs.")
         return
+    
+    if return_col == "intraday_return" and analysis_df["intraday_return"].isna().all():
+        st.warning(
+            "Intraday return is unavailable for all rows. "
+            "This happens when yfinance cannot return Open and Close prices "
+            "for these tickers on these dates (common for weekends, holidays, "
+            "or when the news date is outside the price data window). "
+            "Switch to 'Next-day close return' which has broader coverage."
+        )
+    return
 
     r,   p_value   = stats.pearsonr(analysis_df[score_col], analysis_df[return_col])
     rho, p_spearman = stats.spearmanr(analysis_df[score_col], analysis_df[return_col])
@@ -840,20 +850,43 @@ def show_correlation_analysis(sentiment_scores_df, price_df):
         )
 
     # Scatter with OLS trendline
+    import numpy as np
+
     fig = px.scatter(
-        analysis_df,
-        x=score_col,
-        y=return_col,
-        color="ticker",
-        hover_data=["headline"] if "headline" in analysis_df.columns else None,
-        trendline="ols",
-        title=f"Aggregated Sentiment Score vs {return_col.replace('_', ' ').title()}",
-        labels={
-            score_col:  "Aggregated Sentiment Score (−1 to +1)",
-            return_col: "Price Return (%)"
-        },
-        template="plotly_white",
+    analysis_df,
+    x=score_col,
+    y=return_col,
+    color="ticker",
+    hover_data=["headline"] if "headline" in analysis_df.columns else None,
+    # trendline="ols" REMOVED — requires statsmodels which is not always installed
+    title=f"Aggregated Sentiment Score vs {return_col.replace('_', ' ').title()}",
+    labels={
+        score_col:  "Aggregated Sentiment Score (−1 to +1)",
+        return_col: "Price Return (%)"
+    },
+    template="plotly_white",
     )
+    # Draw OLS trendline manually using numpy (no statsmodels dependency)
+    clean = analysis_df[[score_col, return_col]].dropna()
+    if len(clean) >= 3:
+        try:
+            m, b  = np.polyfit(clean[score_col], clean[return_col], 1)
+            x_min = clean[score_col].min()
+            x_max = clean[score_col].max()
+            x_line = np.linspace(x_min, x_max, 100)
+            y_line = m * x_line + b
+
+            fig.add_scatter(
+                x=x_line,
+                y=y_line,
+                mode="lines",
+                line=dict(color="black", width=1.5, dash="dash"),
+                name=f"OLS trend (r={r:.2f})",
+                showlegend=True,
+            )
+        except Exception:
+            pass 
+
     fig.update_layout(height=420)
     st.plotly_chart(fig, use_container_width=True)
 

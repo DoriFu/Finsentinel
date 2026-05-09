@@ -1315,22 +1315,7 @@ if input_mode == "Live Yahoo Finance headlines" and not news_snap.empty:
             )
 
             st.subheader("Daily Aggregated Sentiment Scores")
-            st.caption(
-                f"Active score: **{score_col}** "
-                f"({'Raw: positive − negative probability' if score_col == 'sentiment_score' else 'Severity-weighted: confidence × directional score'})"
-            )
-            display_cols = [
-                "ticker", "pub_date", score_col,
-                "positive_count", "negative_count", "neutral_count",
-                "total_headlines", "avg_confidence"
-            ]
-            scores_df = st.session_state["sentiment_scores"]
-            display_cols = [c for c in display_cols if c in scores_df.columns]
-            st.dataframe(
-                scores_df[display_cols].sort_values(["ticker", "pub_date"]).reset_index(drop=True),
-                use_container_width=True
-            )
-
+            st.dataframe(st.session_state["sentiment_scores"], use_container_width=True)
 # ---------------------------------------------------------------------------
 # Method trace + downloads
 # ---------------------------------------------------------------------------

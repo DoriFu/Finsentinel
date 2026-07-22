@@ -1,0 +1,17 @@
+streamlit
+plotly
+yfinance
+scipy
+statsmodels
+feedparser
+rank-bm25
+spacy
+requests
+pandas
+numpy
+torch
+transformers
+scikit-learn
+datasets
+openai
+peft

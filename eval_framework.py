@@ -30,6 +30,7 @@ from sklearn.metrics import accuracy_score, f1_score, cohen_kappa_score
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from statsmodels.stats.proportion import proportion_confint
+from statsmodels.stats.contingency_tables import mcnemar
 
 from finsentinel_v3 import (
     CONFIG,
@@ -175,6 +176,70 @@ def build_comparison_table(results):
         "macro_f1": round(r["macro_f1"], 3),
     } for r in results]
     return pd.DataFrame(rows).sort_values("macro_f1", ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# McNemar's test — is a headline accuracy gap between two paired conditions
+# (e.g. zero-shot vs few-shot vs CoT, scored on the same eval_df rows) real,
+# or within sampling noise? Wilson CIs on two marginal accuracies can overlap
+# or not overlap without actually answering this — McNemar's test is the
+# correct paired test because it only looks at the rows where the two
+# conditions disagree.
+# ---------------------------------------------------------------------------
+
+def mcnemar_test(y_true, preds_a, preds_b, model_a_name="A", model_b_name="B", verbose=True):
+    y_true  = pd.Series(y_true).astype(str).str.lower().str.strip().reset_index(drop=True)
+    preds_a = pd.Series(preds_a).astype(str).str.lower().str.strip().reset_index(drop=True)
+    preds_b = pd.Series(preds_b).astype(str).str.lower().str.strip().reset_index(drop=True)
+
+    correct_a = (preds_a == y_true)
+    correct_b = (preds_b == y_true)
+
+    both_correct = int((correct_a & correct_b).sum())
+    a_only       = int((correct_a & ~correct_b).sum())   # a right, b wrong
+    b_only       = int((~correct_a & correct_b).sum())   # b right, a wrong
+    both_wrong   = int((~correct_a & ~correct_b).sum())
+
+    table = [[both_correct, a_only], [b_only, both_wrong]]
+    # Exact binomial test when discordant pairs are few, else chi-square with
+    # continuity correction — this is statsmodels' own recommended threshold.
+    n_discordant = a_only + b_only
+    result = mcnemar(table, exact=(n_discordant < 25), correction=True)
+
+    row = {
+        "model_a": model_a_name,
+        "model_b": model_b_name,
+        "n": len(y_true),
+        "a_only_correct": a_only,
+        "b_only_correct": b_only,
+        "statistic": float(result.statistic),
+        "p_value": float(result.pvalue),
+        "significant": bool(result.pvalue < 0.05),
+    }
+    if verbose:
+        print(f"McNemar's test: {model_a_name} vs {model_b_name}")
+        print(f"  Discordant pairs — {model_a_name} only correct: {a_only}, "
+              f"{model_b_name} only correct: {b_only}")
+        print(f"  statistic = {result.statistic:.3f}  p-value = {result.pvalue:.4f}")
+        verdict = "SIGNIFICANT" if row["significant"] else "not significant"
+        print(f"  → {verdict} at alpha=0.05")
+    return row
+
+
+def run_pairwise_mcnemar(eval_df, condition_preds, verbose=True):
+    """
+    condition_preds: {condition_name: [predicted labels aligned to eval_df rows]}.
+    Runs McNemar's test on every pair of conditions, e.g. GPT_CONDITIONS
+    predictions from predict_gpt_condition() — zero-shot vs few-shot,
+    few-shot vs CoT, etc.
+    """
+    y_true = eval_df[CONFIG["label_col"]]
+    names = list(condition_preds.keys())
+    rows = [
+        mcnemar_test(y_true, condition_preds[a], condition_preds[b], a, b, verbose)
+        for a, b in itertools.combinations(names, 2)
+    ]
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +624,9 @@ def _cli():
     p_curve.add_argument("--adapter-dir", default="finbert_lora_adapter")
     p_curve.add_argument("--out-html", default="degradation_curve.html")
 
+    sub.add_parser("mcnemar", help="Pairwise McNemar's test across zero-shot/few-shot/CoT/RAG+CoT "
+                                    "on the frozen eval set — is the accuracy gap real or noise?")
+
     args = parser.parse_args()
 
     if args.command == "build-eval-set":
@@ -578,6 +646,13 @@ def _cli():
         plot_degradation_curve(curve_df, out_path=args.out_html)
         curve_df.to_csv("degradation_curve.csv", index=False)
         print(f"Wrote degradation_curve.csv and {args.out_html}")
+
+    elif args.command == "mcnemar":
+        eval_df = load_frozen_eval_set()
+        condition_preds = {mode: predict_gpt_condition(eval_df, mode) for mode in GPT_CONDITIONS}
+        mcnemar_df = run_pairwise_mcnemar(eval_df, condition_preds)
+        mcnemar_df.to_csv("mcnemar_results.csv", index=False)
+        print(f"Wrote mcnemar_results.csv")
 
 
 if __name__ == "__main__":

@@ -15,3 +15,7 @@ scikit-learn
 datasets
 openai
 peft
+openai-whisper
+pyannote.audio
+yt-dlp
+pydub

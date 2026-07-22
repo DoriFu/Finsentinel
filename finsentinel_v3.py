@@ -14,10 +14,11 @@ import re
 import json
 import time
 import random
+import logging
 import hashlib
 import warnings
 import itertools
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -25,6 +26,33 @@ import pandas as pd
 import streamlit as st
 
 warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# Structured logging — every API call, parse failure, fallback trigger, and
+# latency measurement is recorded so production failures can be diagnosed
+# after the fact instead of only reproduced live.
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler("finsentinel.log"), logging.StreamHandler()],
+)
+logger = logging.getLogger("finsentinel")
+
+
+def logged_call(func, *args, **kwargs):
+    """Runs func, logging OK/latency or FAILED/error. Returns (result, status)."""
+    start = time.time()
+    try:
+        result = func(*args, **kwargs)
+        latency_ms = (time.time() - start) * 1000
+        logger.info(f"{func.__name__} OK latency={latency_ms:.0f}ms")
+        return result, "ok"
+    except Exception as e:
+        latency_ms = (time.time() - start) * 1000
+        logger.error(f"{func.__name__} FAILED latency={latency_ms:.0f}ms error={e}")
+        return None, str(e)
 
 # ---------------------------------------------------------------------------
 # Optional dependencies — graceful fallbacks throughout
@@ -232,6 +260,7 @@ def call_llm(prompt, temperature=0, model=None):
     if client is None:
         return None
     model = model or CONFIG["llm_model"]
+    start = time.time()
     try:
         response = client.chat.completions.create(
             model=model,
@@ -239,12 +268,19 @@ def call_llm(prompt, temperature=0, model=None):
             temperature=temperature,
             max_tokens=400
         )
+        latency_ms = (time.time() - start) * 1000
         raw = response.choices[0].message.content.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
-    except json.JSONDecodeError:
+        parsed = json.loads(raw)
+        logger.info(f"call_llm OK model={model} latency={latency_ms:.0f}ms")
+        return parsed
+    except json.JSONDecodeError as e:
+        latency_ms = (time.time() - start) * 1000
+        logger.warning(f"call_llm PARSE_ERROR model={model} latency={latency_ms:.0f}ms error={e}")
         return None
     except Exception as e:
+        latency_ms = (time.time() - start) * 1000
+        logger.error(f"call_llm FAILED model={model} latency={latency_ms:.0f}ms error={e}")
         st.warning(f"API error, using fallback instead: {e}")
         time.sleep(1)
         return None
@@ -430,12 +466,21 @@ def parse_pub_date(entry):
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_headlines(ticker, max_results=40):
     if not FEEDPARSER_OK:
+        logger.warning(f"fetch_headlines SKIPPED ticker={ticker} reason=feedparser_not_installed")
         return []
     url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+    start = time.time()
     try:
         feed = feedparser.parse(url)
-    except Exception:
+    except Exception as e:
+        logger.error(f"fetch_headlines FAILED ticker={ticker} error={e}")
         return []
+    latency_ms = (time.time() - start) * 1000
+    if getattr(feed, "bozo", False):
+        logger.warning(f"fetch_headlines PARSE_ERROR ticker={ticker} latency={latency_ms:.0f}ms "
+                        f"error={getattr(feed, 'bozo_exception', 'unknown')}")
+    else:
+        logger.info(f"fetch_headlines OK ticker={ticker} entries={len(feed.entries)} latency={latency_ms:.0f}ms")
     seen_hashes = set()
     results = []
     for entry in feed.entries[:max_results]:
@@ -471,8 +516,46 @@ def fetch_live_news(tickers, max_results=20):
         all_headlines.extend(rows)
         time.sleep(0.1)
     if not all_headlines:
+        logger.warning(f"fetch_live_news EMPTY tickers={tickers}")
         return pd.DataFrame(columns=["ticker", "headline", "pub_datetime", "pub_date", "pub_hour", "source"])
+    logger.info(f"fetch_live_news OK tickers={tickers} rows={len(all_headlines)}")
     return pd.DataFrame(all_headlines).drop_duplicates(subset=["headline"]).reset_index(drop=True)
+
+
+MAX_AGE_MINUTES = 30
+
+
+def fetch_live_news_with_freshness(tickers, max_results=20):
+    """
+    Every data source in the app needs a timestamp and a maximum age: stale
+    data should show a warning, not silently display old results. Wraps
+    fetch_live_news with a session-tracked fetch time (independent of
+    Streamlit's own TTL cache) so the UI always reflects true data age.
+    """
+    cache_key = "live_news_" + ",".join(sorted(tickers))
+    ts_key = cache_key + "_ts"
+
+    now = datetime.now(timezone.utc)
+    cached_df = st.session_state.get(cache_key)
+    cached_ts = st.session_state.get(ts_key)
+
+    if cached_df is not None and cached_ts is not None:
+        age = now - cached_ts
+        age_minutes = age.total_seconds() / 60
+        if age_minutes < MAX_AGE_MINUTES:
+            st.caption(f"Data from {age_minutes:.0f}m ago (refreshes automatically after {MAX_AGE_MINUTES}m).")
+            return cached_df
+        st.warning(f"Data is {age_minutes:.0f}m old (max age {MAX_AGE_MINUTES}m) — refreshing...")
+
+    news_df = fetch_live_news(tickers, max_results=max_results)
+    st.session_state[cache_key] = news_df
+    st.session_state[ts_key] = now
+    if not news_df.empty:
+        st.caption("Data freshly fetched just now.")
+    elif cached_df is not None:
+        st.error("Could not refresh headlines. Showing the last cached data instead.")
+        return cached_df
+    return news_df
 
 # ---------------------------------------------------------------------------
 # Fallback structured risk layer
@@ -555,6 +638,7 @@ def fallback_structured_risk(headline):
 
 def normalize_structured_output(result, headline):
     if not isinstance(result, dict):
+        logger.info(f"fallback_triggered headline={headline[:60]!r} reason=no_llm_result")
         return fallback_structured_risk(headline)
     fallback = fallback_structured_risk(headline)
     allowed = {
@@ -682,6 +766,7 @@ def fetch_price_returns(tickers_tuple, dates_tuple, lookahead_days=1):
 
         # Try up to 3 times with increasing delays
         for attempt in range(3):
+            attempt_start = time.time()
             try:
                 time.sleep(attempt * 1.5)
                 raw = yf.download(
@@ -689,13 +774,22 @@ def fetch_price_returns(tickers_tuple, dates_tuple, lookahead_days=1):
                     progress=False, auto_adjust=True,
                     timeout=15
                 )
+                latency_ms = (time.time() - attempt_start) * 1000
                 if not raw.empty:
+                    logger.info(f"fetch_price_returns OK ticker={ticker} attempt={attempt+1} "
+                                f"latency={latency_ms:.0f}ms")
                     price_data = raw
                     break
-            except Exception:
+                logger.warning(f"fetch_price_returns EMPTY ticker={ticker} attempt={attempt+1} "
+                                f"latency={latency_ms:.0f}ms")
+            except Exception as e:
+                latency_ms = (time.time() - attempt_start) * 1000
+                logger.warning(f"fetch_price_returns RETRY ticker={ticker} attempt={attempt+1} "
+                               f"latency={latency_ms:.0f}ms error={e}")
                 continue
 
         if price_data.empty:
+            logger.error(f"fetch_price_returns FAILED ticker={ticker} after 3 attempts")
             # Still add rows with None returns so ticker appears in output
             for date in dates:
                 results.append({
@@ -1245,7 +1339,7 @@ def main():
 
     if input_mode == "Live Yahoo Finance headlines":
         tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
-        news_df = fetch_live_news(tickers, max_results=max_per_ticker)
+        news_df = fetch_live_news_with_freshness(tickers, max_results=max_per_ticker)
         if news_df.empty:
             st.warning("Could not fetch live headlines. Paste headlines or install feedparser: pip install feedparser")
             input_df = pd.DataFrame({"Headline": DEFAULT_CORPUS[:8]})
@@ -1498,6 +1592,35 @@ def main():
         )
 
     # ---------------------------------------------------------------------------
+    # McNemar's test — is the zero-shot → few-shot → CoT improvement real?
+    # ---------------------------------------------------------------------------
+    st.markdown("---")
+    st.header("Statistical Significance (McNemar's Test)")
+    mcnemar_csv = "mcnemar_results.csv"
+    if os.path.exists(mcnemar_csv):
+        mcnemar_df = pd.read_csv(mcnemar_csv)
+        st.caption(
+            "Paired test on the frozen eval set: does one prompting condition get rows right "
+            "that another gets wrong more often than the reverse? Unlike comparing two Wilson "
+            "CIs, this only looks at the rows where predictions disagree, so it directly answers "
+            "whether an accuracy gap (e.g. zero-shot vs few-shot) is real or sampling noise."
+        )
+        st.dataframe(mcnemar_df, use_container_width=True)
+        for _, row in mcnemar_df.iterrows():
+            verdict = "significant" if row["significant"] else "not significant"
+            st.write(
+                f"**{row['model_a']} vs {row['model_b']}**: p = {row['p_value']:.4f} → {verdict} "
+                f"({row['model_a']} only correct: {row['a_only_correct']}, "
+                f"{row['model_b']} only correct: {row['b_only_correct']})"
+            )
+    else:
+        st.info(
+            "Not generated yet. Run `python eval_framework.py mcnemar` "
+            "(requires an OpenAI API key for the GPT prompting conditions) "
+            "to produce mcnemar_results.csv, then reload this page."
+        )
+
+    # ---------------------------------------------------------------------------
     # Human evaluation — inter-rater agreement + model-vs-human kappa
     # ---------------------------------------------------------------------------
     st.markdown("---")
@@ -1525,6 +1648,106 @@ def main():
             if "model_pred" in ratings_df.columns:
                 model_kappa = cohen_kappa_score(majority, ratings_df["model_pred"])
                 st.metric("Model vs. majority-human kappa", f"{model_kappa:.3f}")
+
+    # ---------------------------------------------------------------------------
+    # Phase 3: Audio pipeline — earnings calls / podcasts lead headlines
+    # ---------------------------------------------------------------------------
+    st.markdown("---")
+    st.header("Audio Pipeline (Earnings Calls / Podcasts)")
+    st.caption(
+        "Headlines are lagging indicators — by publication time the market has often "
+        "already moved. Earnings-call and podcast audio carries forward-looking guidance "
+        "(CEO tone, analyst confidence, specific guidance language) that can lead price "
+        "moves. This transcribes audio, diarizes speakers, scores sentiment + "
+        "forward-looking language per speaker turn, and fuses it with the headline "
+        "signal into one score, weighted toward audio since it leads while text lags."
+    )
+
+    try:
+        import audio_pipeline as ap
+        AUDIO_PIPELINE_OK = True
+    except Exception:
+        AUDIO_PIPELINE_OK = False
+
+    if not AUDIO_PIPELINE_OK:
+        st.warning("Could not import audio_pipeline.py — check it's in the working directory.")
+    else:
+        dep_cols = st.columns(4)
+        dep_cols[0].write("Whisper: " + ("✓" if ap.WHISPER_OK else "pip install openai-whisper"))
+        dep_cols[1].write("pyannote: " + ("✓" if ap.PYANNOTE_OK else "pip install pyannote.audio"))
+        dep_cols[2].write("FinBERT: " + ("✓" if ap.TRANSFORMERS_OK else "keyword fallback"))
+        dep_cols[3].write("SEC EDGAR: " + ("✓" if ap.REQUESTS_OK else "pip install requests"))
+
+        audio_ticker = st.text_input("Ticker for this recording", "AAPL", key="audio_ticker_input")
+        source_mode = st.radio("Audio source", ["Upload file", "YouTube URL"], horizontal=True, key="audio_source_radio")
+
+        audio_path = None
+        if source_mode == "Upload file":
+            uploaded_audio = st.file_uploader("Upload earnings call / podcast audio", type=["mp3", "wav", "m4a"],
+                                               key="audio_file_upload")
+            if uploaded_audio is not None:
+                audio_path = os.path.join(".", f"uploaded_{uploaded_audio.name}")
+                with open(audio_path, "wb") as f:
+                    f.write(uploaded_audio.getbuffer())
+        else:
+            yt_url = st.text_input("YouTube URL (earnings call recording, podcast, interview clip)",
+                                    key="audio_yt_url")
+            if yt_url and st.button("Download audio", key="audio_download_btn"):
+                try:
+                    with st.spinner("Downloading audio with yt-dlp..."):
+                        audio_path = ap.download_audio(yt_url, output_path="downloaded_audio.mp3")
+                    st.session_state["audio_downloaded_path"] = audio_path
+                    st.success(f"Downloaded to {audio_path}")
+                except Exception as e:
+                    st.error(f"Download failed: {e}")
+            audio_path = st.session_state.get("audio_downloaded_path")
+
+        hf_token = st.text_input("HuggingFace token (for pyannote speaker diarization)",
+                                  type="password", key="audio_hf_token")
+        whisper_model_size = st.selectbox("Whisper model size", ["tiny", "base", "small", "medium", "large"],
+                                           index=3, key="audio_whisper_size")
+
+        if audio_path and st.button("Run audio analysis", type="primary", key="audio_run_btn"):
+            if not (ap.WHISPER_OK and ap.PYANNOTE_OK):
+                st.error(
+                    "Both openai-whisper and pyannote.audio must be installed to run the "
+                    "full pipeline: pip install openai-whisper pyannote.audio"
+                )
+            else:
+                try:
+                    with st.spinner("Transcribing, diarizing, and scoring speaker turns..."):
+                        audio_df, speaker_blocks = ap.run_audio_pipeline(
+                            audio_path, audio_ticker, hf_token=hf_token or None,
+                            whisper_model=whisper_model_size,
+                        )
+                    st.session_state["audio_signals_df"] = audio_df
+                    st.success(f"Extracted signals from {len(speaker_blocks)} speaker turns.")
+                except Exception as e:
+                    st.error(f"Audio pipeline failed: {e}")
+
+        if "audio_signals_df" in st.session_state:
+            audio_signals_df = st.session_state["audio_signals_df"]
+            st.subheader("Per-Speaker-Turn Signals")
+            st.dataframe(audio_signals_df, use_container_width=True)
+
+            if ("sentiment_scores" in st.session_state
+                    and audio_ticker in st.session_state["sentiment_scores"]["ticker"].unique()):
+                sentiment_scores_df = st.session_state["sentiment_scores"]
+                available_dates = sorted(
+                    sentiment_scores_df.loc[sentiment_scores_df["ticker"] == audio_ticker, "pub_date"].unique()
+                )
+                fuse_date = st.selectbox("Date to fuse with the headline signal", available_dates,
+                                          key="audio_fuse_date")
+                unified = ap.compute_unified_signal(audio_signals_df, sentiment_scores_df, audio_ticker, fuse_date)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Audio signal", f"{unified['audio_signal']:.3f}")
+                c2.metric("Text (headline) signal", f"{unified['text_signal']:.3f}")
+                c3.metric("Unified score (0.6 audio / 0.4 text)", f"{unified['unified_score']:.3f}")
+            else:
+                st.info(
+                    "Run the 'Sentiment → Price Correlation' section above for this ticker "
+                    "first to fuse the audio signal with the headline signal."
+                )
 
     # ---------------------------------------------------------------------------
     # Method trace + downloads
